@@ -107,12 +107,12 @@ async def fetch_spot_price() -> float:
 # MODULE 6.2 — FORMATTED OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _format_expiry(expiry_ts: int) -> str:
-    """Format Deribit expiry timestamp (ms) as '16 Jan 25'."""
+def _format_expiry_longform(expiry_ts: int) -> str:
+    """Format Deribit expiry timestamp (ms) as '16 January 2025'."""
     if expiry_ts == 0:
         return "N/A"
     dt = datetime.utcfromtimestamp(expiry_ts / 1000)
-    return dt.strftime("%d %b %y")
+    return f"{dt.day} {dt.strftime('%B %Y')}"
 
 
 def _format_usd(val: float) -> str:
@@ -129,6 +129,7 @@ def print_final_report(
     stats: Optional[FetchStats],
     spot_price: float,
     params: ExtendedMILPParams,
+    spot_drift: Optional[dict] = None,
 ) -> None:
     """
     Print the full human-readable optimization report.
@@ -142,6 +143,8 @@ def print_final_report(
         stats:       FetchStats from Step 1 (None for synthetic data).
         spot_price:  ETH spot price used.
         params:      ExtendedMILPParams used.
+        spot_drift:  Optional dict with spot drift info (elapsed_seconds,
+                     spot_initial, spot_final, drift_pct, is_stale).
     """
     W = 60
     border  = "\u2550" * W
@@ -180,42 +183,35 @@ def print_final_report(
     if result.relaxation_step > 0:
         status_name += f" (relaxed {result.relaxation_step}/3)"
 
-    print(f"\nOPTIMAL POSITION  [Solver: {solver_name} | Status: {status_name}]")
+    n_legs = len(result.active_legs)
+    print(f"\nOPTIMAL POSITION — {n_legs} Leg{'s' if n_legs != 1 else ''}  "
+          f"[Solver: {solver_name} | Status: {status_name}]")
     print(divider)
-    print(
-        f"  {'Leg':<4} {'Type':<5} {'Strike':>7} {'Expiry':<10} "
-        f"{'Dir':<6} {'Qty':>4} {'Premium':>9} {'Entry $':>9}"
-    )
-    print(
-        f"  {'-'*4} {'-'*5} {'-'*7} {'-'*10} "
-        f"{'-'*6} {'-'*4} {'-'*9} {'-'*9}"
-    )
 
-    leg_num = 0
     for i in result.active_legs:
         inst = final_pkg.instruments[i]
         xi   = result.x[i]
-        leg_num += 1
 
-        opt_type  = inst.option_type.upper()
-        direction = "SHORT" if xi < 0 else "LONG"
-        expiry    = _format_expiry(inst.expiry_ts)
-        premium_usd = inst.mark_price * spot_price
+        action   = "BUY" if xi > 0 else "SELL"
+        opt_type = inst.option_type.upper()
+        expiry   = _format_expiry_longform(inst.expiry_ts)
 
-        # Entry cost: long pays ask, short receives bid
-        if xi > 0:
-            entry_usd = inst.best_ask * spot_price * xi
-        else:
-            entry_usd = inst.best_bid * spot_price * xi  # negative (credit)
-
-        print(
-            f"  {leg_num:<4} {opt_type:<5} {inst.strike:>7,.0f} {expiry:<10} "
-            f"{direction:<6} {xi:>+4} ${premium_usd:>7.2f} "
-            f"{'$' if entry_usd >= 0 else '-$'}{abs(entry_usd):>7.2f}"
-        )
+        print(f"  {action} {opt_type} {inst.strike:,.0f} {expiry}  (qty {xi:+d})")
 
     if not result.active_legs:
         print("  (no active positions \u2014 zero solution)")
+
+    # ── CONSTRAINT RELAXATION (Mod 2) ─────────────────────────────────────────
+    if result.relaxation_step > 0 and result.params_used is not None:
+        p_relaxed = result.params_used
+        print(f"\nCONSTRAINT RELAXATION  (step {result.relaxation_step}/3 needed)")
+        print(divider)
+        # Step 1 always applies if relaxation_step >= 1
+        print(f"  PNL_FLOOR:      ${params.pnl_floor:,.0f}  \u2192  ${p_relaxed.pnl_floor:,.0f}  (+20%)")
+        if result.relaxation_step >= 2:
+            print(f"  MARGIN_BUDGET:  ${params.margin_budget:,.0f}  \u2192  ${p_relaxed.margin_budget:,.0f}  (+20%)")
+        if result.relaxation_step >= 3:
+            print(f"  MAX_DELTA:       {params.max_delta:.3f}  \u2192  {p_relaxed.max_delta:.3f}  (\u00d72.0)")
 
     # ── NET GREEKS ────────────────────────────────────────────────────────────
     print(f"\nNET GREEKS")
@@ -335,6 +331,24 @@ def print_final_report(
         for msg in refinement.diagnostics:
             print(f"  {msg}")
 
+    # ── LIVE SPOT DRIFT WARNING (Mod 3) ──────────────────────────────────────
+    if spot_drift is not None:
+        elapsed = spot_drift["elapsed_seconds"]
+        drift   = spot_drift["drift_pct"]
+        if spot_drift["is_stale"]:
+            print(f"\n\u26a0  POSITION MAY BE STALE")
+            print(divider)
+            print(f"  Solver took {elapsed:.1f}s")
+            print(
+                f"  Spot: ${spot_drift['spot_initial']:,.0f} \u2192 "
+                f"${spot_drift['spot_final']:,.0f}  "
+                f"({drift:+.1%} drift)"
+            )
+            print(f"  Recommendation: re-run optimizer")
+        else:
+            print(f"\n\u2713 Position valid  "
+                  f"(solver {elapsed:.1f}s, spot drift {drift:+.1%})")
+
     # ── FOOTER ────────────────────────────────────────────────────────────────
     if stats:
         total    = stats.total_instruments
@@ -389,6 +403,9 @@ async def run_live_pipeline(
 
     # Update params with live spot
     params.spot_price = spot_price
+    # If range_high was not explicitly set, use spot as the profit-zone center
+    if params.range_high <= 0:
+        params.range_high = spot_price
 
     # ── Step 1b: Fetch options ───────────────────────────────────────────────
     if verbose:
@@ -422,10 +439,27 @@ async def run_live_pipeline(
             f"Solving Extended MILP "
             f"({pkg.n_instruments} instruments x {len(MARKET_SCENARIOS)} scenarios)..."
         )
+    solver_start = time.monotonic()
     result = solve_portfolio_v4(pkg, params)
+    solver_elapsed = time.monotonic() - solver_start
 
     if verbose:
         print(f"  Status: {result.status.name}, time: {result.solve_time:.2f}s")
+
+    # ── Step 4b: Spot drift check (only if solver was slow) ──────────────────
+    spot_drift: Optional[dict] = None
+    if solver_elapsed > 15:
+        spot_now = await fetch_spot_price()
+        drift = abs(spot_now - spot_price) / spot_price
+        spot_drift = {
+            "elapsed_seconds": solver_elapsed,
+            "spot_initial":    spot_price,
+            "spot_final":      spot_now,
+            "drift_pct":       (spot_now - spot_price) / spot_price,
+            "is_stale":        drift > 0.03,
+        }
+        if verbose:
+            print(f"  Spot drift: {spot_drift['drift_pct']:+.1%}")
 
     # ── Step 5: Margin refinement ────────────────────────────────────────────
     if verbose:
@@ -453,6 +487,7 @@ async def run_live_pipeline(
         stats      = stats,
         spot_price = spot_price,
         params     = params,
+        spot_drift = spot_drift,
     )
 
 
@@ -470,6 +505,8 @@ def run_synthetic(
     Useful for testing the full pipeline without Deribit access.
     """
     spot_price = params.spot_price
+    if params.range_high <= 0:
+        params.range_high = spot_price
     if verbose:
         print(f"Synthetic mode: spot=${spot_price:,.0f}")
 
@@ -640,13 +677,13 @@ def build_argparse() -> argparse.ArgumentParser:
 
     # Optimization parameters
     parser.add_argument(
-        "--floor", type=float, default=-400.0,
+        "--floor", type=float, default=-1500.0,
         help="Minimum P&L floor at all price points (USD)")
     parser.add_argument(
-        "--ceiling", type=float, default=400.0,
-        help="Minimum P&L ceiling at range_high price (USD)")
+        "--ceiling", type=float, default=-500.0,
+        help="Minimum P&L at range_high price (USD). 0 = break-even at target.")
     parser.add_argument(
-        "--margin", type=float, default=5_000.0,
+        "--margin", type=float, default=15_000.0,
         help="Margin budget (USD)")
     parser.add_argument(
         "--max-qty", type=int, default=10,
@@ -657,14 +694,20 @@ def build_argparse() -> argparse.ArgumentParser:
 
     # Greeks limits
     parser.add_argument(
-        "--max-delta", type=float, default=0.15,
+        "--max-delta", type=float, default=0.50,
         help="Max absolute portfolio delta")
     parser.add_argument(
-        "--max-vega", type=float, default=600.0,
+        "--max-vega", type=float, default=2000.0,
         help="Max absolute portfolio vega (USD/1%% IV)")
     parser.add_argument(
-        "--max-gamma", type=float, default=0.008,
+        "--max-gamma", type=float, default=0.050,
         help="Max negative gamma")
+    parser.add_argument(
+        "--range-high", type=float, default=None,
+        help=(
+            "Price at which P&L must reach the ceiling target (USD). "
+            "Defaults to current ETH spot price if not set."
+        ))
 
     # System
     parser.add_argument(
@@ -689,16 +732,19 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Build params (spot will be set later for live mode)
+    # Build params (spot + range_high will be finalized in live pipeline)
     params = ExtendedMILPParams(
         spot_price    = args.spot if args.spot else 2_000.0,
         max_qty       = args.max_qty,
         margin_budget = args.margin,
         pnl_floor     = args.floor,
         pnl_ceiling   = args.ceiling,
+        # 0.0 = sentinel: pipeline will replace with live spot
+        range_high    = args.range_high if args.range_high else 0.0,
         holding_days  = args.holding_days,
         max_delta     = args.max_delta,
         max_vega_usd  = args.max_vega,
+        max_gamma     = args.max_gamma,
     )
 
     if args.test:

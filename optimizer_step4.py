@@ -110,16 +110,16 @@ class ExtendedMILPParams:
     # Базовые параметры (те же что в Step 3)
     spot_price:      float = 2_000.0
     max_qty:         int   = 10
-    margin_budget:   float = 5_000.0
-    pnl_floor:       float = -400.0
-    pnl_ceiling:     float = +400.0
+    margin_budget:   float = 15_000.0
+    pnl_floor:       float = -1500.0
+    pnl_ceiling:     float = -500.0
     range_high:      float = 2_200.0
     holding_days:    int   = 5
 
     # Greeks constraints (новые в Step 4)
-    max_delta:       float = 0.15    # |Δ портфеля| ≤ 0.15 ETH на $1 движения
-    max_vega_usd:    float = 600.0   # |Vega| ≤ $600 на 1% IV move
-    max_gamma:       float = 0.008   # Gamma ≥ −0.008 (ограничиваем short gamma)
+    max_delta:       float = 0.50    # |Δ портфеля| ≤ 0.50 ETH на $1 движения
+    max_vega_usd:    float = 2000.0  # |Vega| ≤ $2000 на 1% IV move
+    max_gamma:       float = 0.050   # Gamma ≥ −0.050 (ограничиваем short gamma)
 
     # IV stress параметры
     iv_stress_shift:      float = IV_STRESS_SHIFT

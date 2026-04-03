@@ -48,7 +48,7 @@ from optimizer_step2 import (
 PREFERRED_MIP_SOLVERS: list[str] = ["GLPK_MI", "HIGHS", "CBC", "SCIP"]
 
 # Настройки солвера
-SOLVER_TIME_LIMIT_SECONDS: int  = 30
+SOLVER_TIME_LIMIT_SECONDS: int  = 120
 SOLVER_MAX_ITERS: int           = 10_000
 SOLVER_EPS_ABS: float           = 1e-6
 
