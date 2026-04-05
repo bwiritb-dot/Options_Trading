@@ -44,6 +44,7 @@ from optimizer_step1 import (
 from optimizer_step2 import (
     PayoffPackage,
     build_payoff_package,
+    build_holding_period_payoff_matrix,
 )
 from optimizer_step3 import (
     MILPParams,
@@ -220,6 +221,12 @@ def print_final_report(
     holding = params.holding_days
     print(f"  Theta (USD/day):    ${result.expected_theta_usd:>10.2f}")
     print(f"  Theta x {holding}d total:  ${result.expected_theta_usd * holding:>10.2f}")
+
+    # Fee reporting: fee_vec @ |x|
+    total_fees = np.sum(final_pkg.greeks.fee_vec * np.abs(result.x))
+    net_expected_profit = result.expected_theta_usd * holding - total_fees
+    print(f"  Round-trip Fees:    ${total_fees:>10.2f}")
+    print(f"  Net Profit (θ-fees): ${net_expected_profit:>8.2f}")
     print(f"  Delta:              {result.portfolio_delta:>11.4f}   (limit \u00b1{params.max_delta:.2f})")
     print(f"  Gamma:              {result.portfolio_gamma:>11.5f}   (limit \u2265{-params.max_gamma:.3f})")
     print(f"  Vega (USD/1%):     ${result.portfolio_vega:>10.2f}   (limit \u00b1${params.max_vega_usd:.0f})")
@@ -227,17 +234,18 @@ def print_final_report(
     # ── THETA SCENARIO BREAKDOWN ──────────────────────────────────────────────
     print(f"\nTHETA SCENARIOS")
     print(divider)
-    print(f"  {'Scenario':<10} {'Spot':>8} {'IV shift':>9} {'Prob':>6} {'Theta/d':>10}")
-    print(f"  {'-'*10} {'-'*8} {'-'*9} {'-'*6} {'-'*10}")
+    print(f"  {'Scenario':<12} {'Spot':>8} {'IV shift':>9} {'Prob':>6} {'Theta/d':>10}")
+    print(f"  {'-'*12} {'-'*8} {'-'*9} {'-'*6} {'-'*10}")
 
     for s, theta_s in zip(MARKET_SCENARIOS, result.theta_by_scenario):
         print(
-            f"  {s['name']:<10} x{s['spot_mult']:.2f}    "
+            f"  {s['name']:<12} x{s['spot_mult']:.3f}   "
             f"{s['iv_shift']:>+.0%}     {s['prob']:.0%}    "
             f"${theta_s:>8.2f}"
         )
 
-    print(f"  {'\u2500'*50}")
+    divider_line = '\u2500' * 50
+    print(f"  {divider_line}")
     print(f"  {'Expected (weighted)':>30}   ${result.expected_theta_usd:>8.2f}/d")
     print(f"  {'Deribit theta (point est)':>30}   ${result.portfolio_theta:>8.2f}/d")
 
@@ -270,6 +278,44 @@ def print_final_report(
             mark = "\u2713" if ok else "\u26a0"
             print(f"  ETH ${dp:>5,}:  ${pnl_val:>8,.0f}   {mark}{label}")
 
+    # ── P&L AT EXIT DATE (Black-Scholes pricing, not intrinsic) ────────────
+    print(f"\nP&L AT EXIT DATE (closing at day {params.holding_days})")
+    print(divider)
+
+    holding_matrices = build_holding_period_payoff_matrix(
+        instruments=final_pkg.instruments,
+        spot_price=spot_price,
+        holding_days=params.holding_days,
+        scenarios=MARKET_SCENARIOS,
+    )
+
+    # Entry cost in USD: pay ask for longs, receive bid for shorts
+    # min(x,0) is negative for shorts, so bid * negative = subtract premium received
+    x_vec = result.x
+    cost_usd = float(
+        (final_pkg.entry.ask_vec * np.maximum(x_vec, 0)
+         + final_pkg.entry.bid_vec * np.minimum(x_vec, 0)).sum()
+    ) * spot_price
+
+    # P_hold @ x_vec gives portfolio value at EACH grid price → pick row for scenario spot
+    portfolio_at_grid = {}  # scenario -> array of portfolio values per price
+    for s in MARKET_SCENARIOS:
+        P_hold = holding_matrices[s["name"]]
+        portfolio_at_grid[s["name"]] = P_hold @ x_vec  # shape [M]
+
+    print(f"  {'Scenario':<12} {'Spot':>8} {'Exit P&L':>10}")
+    print(f"  {'-'*12} {'-'*8} {'-'*10}")
+    for s in MARKET_SCENARIOS:
+        scenario_spot = spot_price * s["spot_mult"]
+        # Find closest grid price to scenario spot
+        j_closest = int(np.argmin(np.abs(final_pkg.grid.prices - scenario_spot)))
+        exit_value = float(portfolio_at_grid[s["name"]][j_closest])
+        pnl_exit = exit_value - cost_usd - total_fees
+        print(f"  {s['name']:<12} ${scenario_spot:>7,.0f} ${pnl_exit:>9,.0f}")
+
+    print(f"\n  Note: Exit P&L uses BS pricing (time value preserved)")
+    print(f"        Expiration P&L above is worst-case intrinsic value")
+
     # ── RISK METRICS ──────────────────────────────────────────────────────────
     print(f"\nRISK METRICS")
     print(divider)
@@ -290,10 +336,11 @@ def print_final_report(
     # IV Stress
     stress_floor = params.pnl_floor * IV_STRESS_FLOOR_MULTIPLIER
     stress_ok = result.iv_stress_pnl >= stress_floor - 0.01
+    stress_mark = '\u2713' if stress_ok else '\u26a0'
     print(
         f"  IV Stress P&L:     ${result.iv_stress_pnl:>7,.0f}  "
         f"(IV +{IV_STRESS_SHIFT:.0%})  "
-        f"{'\u2713' if stress_ok else '\u26a0'}"
+        f"{stress_mark}"
     )
 
     # Liquidity score
@@ -480,15 +527,20 @@ async def run_live_pipeline(
         print()
 
     # ── Step 6: Print report ─────────────────────────────────────────────────
+    final_pkg = refinement.pkg if refinement.pkg is not None else pkg
     print_final_report(
         result     = final_result,
         refinement = refinement,
-        pkg        = pkg,
+        pkg        = final_pkg,
         stats      = stats,
         spot_price = spot_price,
         params     = params,
         spot_drift = spot_drift,
     )
+
+    # ── Step 7: Launch P&L chart ─────────────────────────────────────────────
+    from optimizer_chart import launch_chart
+    launch_chart(result=final_result, pkg=final_pkg, params=params, spot_price=spot_price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,6 +589,9 @@ def run_synthetic(
         params     = params,
     )
 
+    from optimizer_chart import launch_chart
+    launch_chart(result=result, pkg=pkg, params=params, spot_price=spot_price)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 6.5 — UNIT TESTS
@@ -567,16 +622,33 @@ def run_unit_tests(verbose: bool = False) -> None:
 
     SPOT = 2_000.0
     params = ExtendedMILPParams(
-        spot_price    = SPOT,
-        max_qty       = 5,
-        margin_budget = 4_000.0,
-        pnl_floor     = -300.0,
-        pnl_ceiling   = +100.0,
-        range_high    = 2_200.0,
-        holding_days  = 5,
-        max_delta     = 0.30,
-        max_vega_usd  = 800.0,
-        max_gamma     = 0.020,
+        spot_price      = SPOT,
+        max_qty         = 500,
+        margin_budget   = 4_000.0,
+        pnl_floor       = -300.0,
+        pnl_ceiling     = +100.0,
+        range_high      = 2_200.0,
+        holding_days    = 5,
+        # Soft Greek limits
+        soft_delta      = 0.30,
+        soft_vega_usd   = 800.0,
+        soft_gamma      = 0.020,
+        # Legacy hard limits (deprecated, kept for compatibility)
+        max_delta       = 0.30,
+        max_vega_usd    = 800.0,
+        max_gamma       = 0.020,
+        # Target line parameters
+        range_low       = SPOT - 200,
+        target_loss     = -500.0,
+        target_profit   = +500.0,
+        # Objective weights (sum = 1.0)
+        weight_theta     = 0.45,
+        weight_deviation = 0.225,
+        weight_greeks    = 0.075,
+        weight_fees      = 0.20,
+        weight_margin    = 0.05,
+        # Hard floor
+        hard_floor      = -2500.0,
     )
 
     instruments = _make_synthetic_instruments(SPOT)
@@ -686,28 +758,61 @@ def build_argparse() -> argparse.ArgumentParser:
         "--margin", type=float, default=15_000.0,
         help="Margin budget (USD)")
     parser.add_argument(
-        "--max-qty", type=int, default=10,
+        "--max-qty", type=int, default=1000,
         help="Max contracts per instrument")
     parser.add_argument(
         "--holding-days", type=int, default=5,
         help="Holding period for theta calculation (days)")
 
-    # Greeks limits
+    # Target line parameters (NEW)
+    parser.add_argument(
+        "--range-low", type=float, default=None,
+        help="Left edge of target P&L line (USD). Defaults to spot-200 if not set.")
+    parser.add_argument(
+        "--target-loss", type=float, default=-500.0,
+        help="Target P&L at range_low (USD, negative = loss)")
+    parser.add_argument(
+        "--target-profit", type=float, default=+500.0,
+        help="Target P&L at range_high (USD, positive = profit)")
+
+    # Greeks limits (soft limits for penalty, not hard constraints)
     parser.add_argument(
         "--max-delta", type=float, default=0.50,
-        help="Max absolute portfolio delta")
+        help="(Deprecated) Soft limit for delta penalty")
     parser.add_argument(
         "--max-vega", type=float, default=2000.0,
-        help="Max absolute portfolio vega (USD/1%% IV)")
+        help="(Deprecated) Soft limit for vega penalty (USD/1%% IV)")
     parser.add_argument(
         "--max-gamma", type=float, default=0.050,
-        help="Max negative gamma")
+        help="(Deprecated) Soft limit for gamma penalty")
     parser.add_argument(
         "--range-high", type=float, default=None,
         help=(
             "Price at which P&L must reach the ceiling target (USD). "
             "Defaults to current ETH spot price if not set."
         ))
+
+    # Objective function weights (NEW)
+    parser.add_argument(
+        "--weight-theta", type=float, default=0.45,
+        help="Weight for theta in objective (default 0.45)")
+    parser.add_argument(
+        "--weight-deviation", type=float, default=0.225,
+        help="Weight for deviation from target line (default 0.225)")
+    parser.add_argument(
+        "--weight-greeks", type=float, default=0.075,
+        help="Weight for greek penalties (default 0.075)")
+    parser.add_argument(
+        "--weight-fees", type=float, default=0.20,
+        help="Weight for fee minimization (default 0.20)")
+    parser.add_argument(
+        "--weight-margin", type=float, default=0.05,
+        help="Weight for margin minimization (default 0.05)")
+
+    # Hard floor (NEW)
+    parser.add_argument(
+        "--hard-floor", type=float, default=-2500.0,
+        help="Absolute minimum P&L at any price (USD, hard constraint)")
 
     # System
     parser.add_argument(
@@ -734,17 +839,30 @@ def main() -> None:
 
     # Build params (spot + range_high will be finalized in live pipeline)
     params = ExtendedMILPParams(
-        spot_price    = args.spot if args.spot else 2_000.0,
-        max_qty       = args.max_qty,
-        margin_budget = args.margin,
-        pnl_floor     = args.floor,
-        pnl_ceiling   = args.ceiling,
+        spot_price      = args.spot if args.spot else 2_000.0,
+        max_qty         = args.max_qty,
+        margin_budget   = args.margin,
+        pnl_floor       = args.floor,
+        pnl_ceiling     = args.ceiling,
         # 0.0 = sentinel: pipeline will replace with live spot
-        range_high    = args.range_high if args.range_high else 0.0,
-        holding_days  = args.holding_days,
-        max_delta     = args.max_delta,
-        max_vega_usd  = args.max_vega,
-        max_gamma     = args.max_gamma,
+        range_high      = args.range_high if args.range_high else 0.0,
+        holding_days    = args.holding_days,
+        # Target line parameters (new)
+        range_low       = args.range_low,
+        target_loss     = args.target_loss,
+        target_profit   = args.target_profit,
+        # Objective weights
+        weight_theta     = args.weight_theta,
+        weight_deviation = args.weight_deviation,
+        weight_greeks    = args.weight_greeks,
+        weight_fees      = args.weight_fees,
+        weight_margin    = args.weight_margin,
+        # Soft Greek limits (for penalty, not hard constraints)
+        soft_delta      = args.max_delta,
+        soft_vega_usd   = args.max_vega,
+        soft_gamma      = args.max_gamma,
+        # Hard floor (new)
+        hard_floor      = args.hard_floor,
     )
 
     if args.test:

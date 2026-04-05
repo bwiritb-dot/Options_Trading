@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(rtk git *)",
+      "Bash(python *)",
+      "Bash(rtk *)",
+      "Bash(pip *)",
+      "Edit",
+      "Write",
+      "Read",
+      "Glob",
+      "Grep"
+    ]
+  },
+  "mcpServers": {
+    "lightrag": {
+      "type": "stdio",
+      "command": "C:\\lightrag-server\\venv\\Scripts\\lightrag-mcp.exe",
+      "args": [
+        "--host",
+        "localhost",
+        "--port",
+        "9621"
+      ]
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"import sys,json,re,subprocess; d=json.load(sys.stdin); fp=d.get('tool_input',{}).get('file_path',''); subprocess.run(['curl','-s','-X','POST','http://localhost:9621/documents/upload','-F','file=@'+fp],capture_output=True) if fp and re.search(r'\\.(py|md)$',fp,re.I) else None\" 2>/dev/null || true",
+            "async": true,
+            "statusMessage": "Syncing to LightRAG..."
+          }
+        ]
+      }
+    ]
+  }
+}

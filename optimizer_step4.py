@@ -84,11 +84,15 @@ IV_STRESS_FLOOR_MULTIPLIER: float = 1.50   # PNL_FLOOR × 1.5 (более мяг
 # iv_shift — абсолютный сдвиг IV в долях (0.08 = +8 пп)
 # Сумма prob = 1.0 — обязательное условие
 MARKET_SCENARIOS: list[dict] = [
-    {"name": "crash",  "spot_mult": 0.90, "iv_shift": +0.08, "prob": 0.10},
-    {"name": "dip",    "spot_mult": 0.95, "iv_shift": +0.03, "prob": 0.20},
-    {"name": "base",   "spot_mult": 1.00, "iv_shift":  0.00, "prob": 0.40},
-    {"name": "rally",  "spot_mult": 1.05, "iv_shift": -0.02, "prob": 0.20},
-    {"name": "surge",  "spot_mult": 1.10, "iv_shift": -0.04, "prob": 0.10},
+    {"name": "crash",      "spot_mult": 0.85,  "iv_shift": +0.12, "prob": 0.03},
+    {"name": "big_dip",    "spot_mult": 0.90,  "iv_shift": +0.08, "prob": 0.07},
+    {"name": "dip",        "spot_mult": 0.95,  "iv_shift": +0.03, "prob": 0.12},
+    {"name": "soft_dip",   "spot_mult": 0.975, "iv_shift": +0.01, "prob": 0.13},
+    {"name": "base",       "spot_mult": 1.00,  "iv_shift":  0.00, "prob": 0.30},
+    {"name": "soft_rally", "spot_mult": 1.025, "iv_shift": -0.01, "prob": 0.13},
+    {"name": "rally",      "spot_mult": 1.05,  "iv_shift": -0.02, "prob": 0.12},
+    {"name": "big_rally",  "spot_mult": 1.10,  "iv_shift": -0.04, "prob": 0.07},
+    {"name": "surge",      "spot_mult": 1.15,  "iv_shift": -0.06, "prob": 0.03},
 ]
 
 # Проверка инварианта: сумма вероятностей = 1
@@ -124,6 +128,26 @@ class ExtendedMILPParams:
     # IV stress параметры
     iv_stress_shift:      float = IV_STRESS_SHIFT
     iv_stress_multiplier: float = IV_STRESS_FLOOR_MULTIPLIER
+
+    # Новые параметры для целевого линейного P&L (Step 4.5)
+    range_low:       float = None    # левый край целевой линии (default: spot - 200)
+    target_loss:     float = -500.0  # целевая убыль при range_low (USD)
+    target_profit:   float = +500.0  # целевая прибыль при range_high (USD)
+
+    # Веса компонентов объективной функции (должны суммироваться в 1.0)
+    weight_theta:    float = 0.45    # вес theta в objective (45%)
+    weight_deviation: float = 0.225  # вес отклонения от целевой линии (22.5%)
+    weight_greeks:   float = 0.075   # вес греческих штрафов (7.5%)
+    weight_fees:     float = 0.20    # вес минимизации комиссий (20%)
+    weight_margin:   float = 0.05    # вес минимизации маржи (5%)
+
+    # Мягкие лимиты для греческих штрафов (не жёсткие constraints)
+    soft_delta:      float = 0.50    # мягкий лимит delta для penalty
+    soft_vega_usd:   float = 2000.0  # мягкий лимит vega для penalty
+    soft_gamma:      float = 0.050   # мягкий лимит gamma для penalty
+
+    # Жёсткий floor для защиты от экстремальных позиций
+    hard_floor:      float = -2500.0 # минимальный P&L при любой цене (USD)
 
     # Внутренний счётчик релаксации
     relaxation_step: int = 0
@@ -561,27 +585,6 @@ def build_extended_milp_problem(
     # ── Стоимость входа (bid/ask split) ──────────────────────────────────────
     cost_usd_expr = (entry.ask_vec @ x_long - entry.bid_vec @ x_short) * spot
 
-    # ── OBJECTIVE: сценарно-взвешенная theta (БЛОК A) ────────────────────────
-    #
-    # Почему это точнее:
-    #   Deribit theta = θ(spot_now, IV_now) — мгновенный снимок.
-    #   За 5 дней holding_days рынок сдвинется. Например:
-    #     - При crash (prob=10%) spot −10%, IV +8% → theta шорт-путов падает
-    #     - При base  (prob=40%) всё как сейчас
-    #   Взвешенная theta учитывает ВСЕ эти исходы.
-    #
-    #   Кроме того, BS theta корректнее учитывает vega-theta trade-off:
-    #   при IV +8% theta краткосрочных ATM опционов существенно меняется.
-    #
-    expected_theta_expr = sum(
-        prob * (theta_s @ x)
-        for prob, theta_s in zip(
-            ext.scenario_theta.scenario_probs,
-            ext.scenario_theta.theta_by_scenario,
-        )
-    )
-    objective = cp.Maximize(expected_theta_expr * params.holding_days)
-
     # ── Constraints ──────────────────────────────────────────────────────────
     constraints: list[cp.Constraint] = []
 
@@ -597,45 +600,19 @@ def build_extended_milp_problem(
     constraints.append(x_long  <= params.max_qty)
     constraints.append(x_short <= params.max_qty)
 
-    # 5. P&L constraints (35 точек) — те же что в Step 3
-    range_high_idx = _find_price_index(grid.prices, params.range_high)
+    # 5. P&L constraints: only hard floor (soft constraints via objective penalty)
+    # Remove per-price floor constraints; keep only hard_floor for all prices
+    total_fees = gr.fee_vec @ z
     for j in range(len(grid.prices)):
-        pnl_expr = P[j] @ x - cost_usd_expr
-        floor = params.pnl_ceiling if j == range_high_idx else params.pnl_floor
-        constraints.append(pnl_expr >= floor)
+        pnl_expr = P[j] @ x - cost_usd_expr - total_fees
+        constraints.append(pnl_expr >= params.hard_floor)
 
     # 6. Маржа (аппроксимация с 25% буфером)
     constraints.append(gr.margin_vec @ z <= params.margin_budget)
 
-    # ── БЛОК B — Greeks constraints ───────────────────────────────────────────
-    #
-    # DELTA: ограничиваем направленный риск портфеля.
-    #   Если delta_portfolio = 0.15, то при росте ETH на $1
-    #   портфель зарабатывает/теряет $0.15.
-    #   Theta-стратегии должны быть близки к delta-neutral.
-    #   Два неравенства вместо cp.abs() — надёжнее для MIP.
-    #
-    constraints.append(gr.delta_vec @ x <=  params.max_delta)
-    constraints.append(gr.delta_vec @ x >= -params.max_delta)
-
-    #
-    # VEGA: ограничиваем чувствительность к изменению IV.
-    #   vega_usd[i] = ETH vega × spot → USD на 1% IV move на контракт.
-    #   При vega_portfolio = −$600, если IV вырастет на 1%,
-    #   портфель потеряет $600 (до вычета theta gain).
-    #   Theta-стратегии (short vol) имеют отрицательную vega —
-    #   constraint защищает от чрезмерного short-vol exposure.
-    #
-    constraints.append(gr.vega_usd @ x <=  params.max_vega_usd)
-    constraints.append(gr.vega_usd @ x >= -params.max_vega_usd)
-
-    #
-    # GAMMA: ограничиваем short-gamma (convexity risk).
-    #   Отрицательная гамма = позиция теряет всё быстрее при сильных
-    #   движениях (квадратичный эффект). Ограничиваем снизу.
-    #   Положительная гамма (long gamma) выгодна → не ограничиваем.
-    #
-    constraints.append(gr.gamma_vec @ x >= -params.max_gamma)
+    # ── БЛОК B — Greeks constraints (MOVED TO SOFT PENALTY IN OBJECTIVE) ───────
+    # Hard constraints removed; Greeks are now soft penalties in the objective function.
+    # Old hard constraints preserved for reference below (commented out):
 
     # ── БЛОК C — IV Stress constraint ────────────────────────────────────────
     #
@@ -643,15 +620,111 @@ def build_extended_milp_problem(
     # Линеен в x → корректен для MILP.
     #
     # Смысл: если IV прыгнет +25% прямо сейчас, наш MTM P&L не должен
-    # быть хуже PNL_FLOOR × multiplier (т.е. −600 при floor=−400).
+    # быть хуже HARD_FLOOR × multiplier (т.е. −3750 при hard_floor=−2500).
     # Это защита от "vega blowup" при экстремальных IV движениях.
     #
     # Важно: это ДОПОЛНЕНИЕ к P&L constraints, не замена.
     # P&L матрица считает payoff при экспирации.
     # IV stress считает мгновенный MTM при IV-шоке.
     #
-    iv_stress_floor = params.pnl_floor * params.iv_stress_multiplier
+    iv_stress_floor = params.hard_floor * params.iv_stress_multiplier
     constraints.append(ext.iv_stress_delta @ x >= iv_stress_floor)
+
+    # ── OBJECTIVE: взвешенная комбинация theta, отклонения и греческих штрафов ──
+    #
+    # Новая объективная функция (Step 4.5):
+    #   maximize: weight_theta × theta_score
+    #           - weight_deviation × deviation_score
+    #           - weight_greeks × greek_penalty_score
+    #
+    expected_theta_expr = sum(
+        prob * (theta_s @ x)
+        for prob, theta_s in zip(
+            ext.scenario_theta.scenario_probs,
+            ext.scenario_theta.theta_by_scenario,
+        )
+    )
+    total_fees = gr.fee_vec @ z
+    theta_pure = expected_theta_expr * params.holding_days
+
+    # Compute target line and deviation score
+    range_low = params.range_low if params.range_low is not None else (spot - 200)
+    range_high = params.range_high
+
+    # Build target line: linear interpolation
+    target_pnls = []
+    pnl_expr_list = []
+
+    for j, price in enumerate(grid.prices):
+        if range_low <= price <= range_high:
+            # Compute target P&L at this price
+            t_param = (price - range_low) / (range_high - range_low) if range_high != range_low else 0.5
+            target_pnl = params.target_loss + t_param * (params.target_profit - params.target_loss)
+            target_pnls.append(target_pnl)
+
+            # Compute actual P&L at this price: P[j] @ x - cost - fees
+            pnl_j = P[j] @ x - cost_usd_expr - total_fees
+            pnl_expr_list.append(pnl_j)
+
+    # Create deviation variables: d_j >= |pnl_j - target_j|
+    num_target_points = len(target_pnls)
+    if num_target_points > 0:
+        d_vars = cp.Variable(num_target_points, name="d_deviation")
+        for i, (pnl_j, target_j) in enumerate(zip(pnl_expr_list, target_pnls)):
+            constraints.append(d_vars[i] >= pnl_j - target_j)
+            constraints.append(d_vars[i] >= -(pnl_j - target_j))
+            constraints.append(d_vars[i] >= 0)
+
+        # Deviation score = mean absolute deviation
+        deviation_score = cp.sum(d_vars) / num_target_points
+    else:
+        deviation_score = 0
+
+    # Greek penalty variables: measure exceedance beyond soft limits
+    # delta_penalty: positive when |delta| > soft_delta
+    delta_penalty_pos = cp.Variable(name="delta_penalty_pos")
+    delta_penalty_neg = cp.Variable(name="delta_penalty_neg")
+    delta_expr = gr.delta_vec @ x
+    constraints.append(delta_penalty_pos >= delta_expr - params.soft_delta)
+    constraints.append(delta_penalty_pos >= 0)
+    constraints.append(delta_penalty_neg >= -delta_expr - params.soft_delta)
+    constraints.append(delta_penalty_neg >= 0)
+    # Normalize to USD: multiply by spot price
+    delta_penalty_usd = (delta_penalty_pos + delta_penalty_neg) * spot
+
+    # vega_penalty: positive when |vega| > soft_vega
+    vega_penalty_pos = cp.Variable(name="vega_penalty_pos")
+    vega_penalty_neg = cp.Variable(name="vega_penalty_neg")
+    vega_expr = gr.vega_usd @ x
+    constraints.append(vega_penalty_pos >= vega_expr - params.soft_vega_usd)
+    constraints.append(vega_penalty_pos >= 0)
+    constraints.append(vega_penalty_neg >= -vega_expr - params.soft_vega_usd)
+    constraints.append(vega_penalty_neg >= 0)
+    # Vega already in USD
+    vega_penalty_usd = vega_penalty_pos + vega_penalty_neg
+
+    # gamma_penalty: positive when gamma < -soft_gamma (short gamma risk)
+    gamma_penalty = cp.Variable(name="gamma_penalty")
+    gamma_expr = gr.gamma_vec @ x
+    constraints.append(gamma_penalty >= -gamma_expr - params.soft_gamma)
+    constraints.append(gamma_penalty >= 0)
+    # Normalize to USD: multiply by spot^2 × 1000 (rough approximation)
+    gamma_penalty_usd = gamma_penalty * spot * spot * 0.001
+
+    # Total greek penalty in USD
+    greek_penalty_usd = delta_penalty_usd + vega_penalty_usd + gamma_penalty_usd
+
+    # Weighted objective
+    # margin_score normalised by budget/100 → comparable scale to fee_score
+    _margin_ref = max(params.margin_budget / 100.0, 1.0)
+    objective_expr = (
+        params.weight_theta    * theta_pure
+        - params.weight_deviation * deviation_score
+        - params.weight_greeks    * greek_penalty_usd
+        - params.weight_fees      * total_fees
+        - params.weight_margin    * (gr.margin_vec @ z) / _margin_ref
+    )
+    objective = cp.Maximize(objective_expr)
 
     problem = cp.Problem(objective, constraints)
     return MILPProblem(
@@ -855,17 +928,17 @@ def solve_portfolio_v4(
         relaxed.relaxation_step = step
 
         if step == 1:
-            relaxed.pnl_floor = params.pnl_floor * 1.20
-            desc = f"PNL_FLOOR → {relaxed.pnl_floor:.0f}"
+            relaxed.hard_floor = params.hard_floor * 1.20  # soften hard floor (make it less strict, e.g., -2500 → -3000)
+            desc = f"HARD_FLOOR → {relaxed.hard_floor:.0f}"
         elif step == 2:
-            relaxed.pnl_floor     = params.pnl_floor    * 1.20
+            relaxed.hard_floor    = params.hard_floor    * 1.20
             relaxed.margin_budget = params.margin_budget * 1.20
             desc = f"+ MARGIN_BUDGET → {relaxed.margin_budget:.0f}"
         else:
-            relaxed.pnl_floor     = params.pnl_floor    * 1.20
+            relaxed.hard_floor    = params.hard_floor    * 1.20
             relaxed.margin_budget = params.margin_budget * 1.20
-            relaxed.max_delta     = params.max_delta     * 2.00
-            desc = f"+ MAX_DELTA → {relaxed.max_delta:.3f}"
+            relaxed.soft_delta    = params.soft_delta     * 2.00  # soften soft delta limit for penalty
+            desc = f"+ SOFT_DELTA → {relaxed.soft_delta:.3f}"
 
         diagnostics.append(f"Релаксация {step}/3: {desc}")
         status, solver_used, milp = _try_with_params(relaxed)

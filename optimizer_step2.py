@@ -375,6 +375,7 @@ class GreekVectors:
     gamma_vec:    npt.NDArray[np.float64]   # 1/ETH
     theta_usd:    npt.NDArray[np.float64]   # USD/день = theta_eth × spot
     vega_usd:     npt.NDArray[np.float64]   # USD на 1% IV
+    fee_vec:      npt.NDArray[np.float64]   # USD round-trip fee per contract (entry + exit)
     margin_vec:   npt.NDArray[np.float64]   # USD (≈ mark_price × spot × 1.25)
 
 
@@ -412,6 +413,17 @@ def build_greek_vectors(
     theta_usd  = np.array([inst.theta * spot_price for inst in instruments], dtype=np.float64)
     vega_usd   = np.array([inst.vega  * spot_price for inst in instruments], dtype=np.float64)
 
+    # Deribit fee: 0.03% of underlying per contract, capped at 12.5% of option price
+    # Round-trip (entry + exit) = 2× single fee
+    # mark_price is ETH-denominated → multiply by spot_price for USD
+    fee_vec = np.array([
+        2.0 * min(
+            0.0003 * spot_price,                    # 0.03% of underlying, USD
+            0.125 * inst.mark_price * spot_price    # 12.5% of option price, USD
+        )
+        for inst in instruments
+    ], dtype=np.float64)
+
     # Линейная аппроксимация маржи: mark_price (ETH) × spot (USD/ETH) × 1.25 буфер
     # Буфер 25% заложен здесь; итерационное уточнение — Шаг 5
     MARGIN_BUFFER: float = 1.25
@@ -425,6 +437,7 @@ def build_greek_vectors(
         gamma_vec  = gamma_vec,
         theta_usd  = theta_usd,
         vega_usd   = vega_usd,
+        fee_vec    = fee_vec,
         margin_vec = margin_vec,
     )
 
@@ -498,6 +511,68 @@ def build_payoff_package(
         n_instruments  = len(instruments),
         n_price_points = len(grid.prices),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOLDING-PERIOD PAYOFF (Black-Scholes at exit date, for reporting)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_holding_period_payoff_matrix(
+    instruments: list[OptionInstrument],
+    spot_price: float,
+    holding_days: int,
+    scenarios: list[dict],
+    rate: float = 0.05,
+) -> dict[str, npt.NDArray[np.float64]]:
+    """
+    Build payoff matrices using Black-Scholes pricing at exit date.
+
+    For each scenario, compute: P_hold[j, i] = BS_price(S_j, K_i, T_exit, IV_exit)
+    where:
+      S_j = grid price point j
+      T_exit = (days_to_expiry - holding_days) / 365
+      IV_exit = mark_iv/100 + scenario iv_shift
+
+    Args:
+        instruments:  List of OptionInstrument from Step 1.
+        spot_price:   Current ETH/USD spot price.
+        holding_days: Number of days position is held.
+        scenarios:    MARKET_SCENARIOS list of dicts with name/spot_mult/iv_shift/prob.
+        rate:         Risk-free rate (annualized decimal).
+
+    Returns:
+        Dict mapping scenario_name -> payoff matrix of shape [M, N].
+    """
+    from optimizer_step4 import bs_price
+
+    grid = build_price_grid(spot_price)
+    n_prices = len(grid.prices)
+    n_instr = len(instruments)
+
+    holding_period_matrices: dict[str, npt.NDArray[np.float64]] = {}
+
+    for scenario in scenarios:
+        P_hold = np.zeros((n_prices, n_instr), dtype=np.float64)
+
+        for j, S_j in enumerate(grid.prices):
+            for i, instr in enumerate(instruments):
+                days_remaining = max(0.0, instr.days_to_expiry - holding_days)
+                T = days_remaining / 365.0
+                sigma = instr.mark_iv / 100.0 + scenario["iv_shift"]
+                sigma = max(sigma, 0.01)  # floor IV at 1% for numerical stability
+
+                P_hold[j, i] = bs_price(
+                    S=S_j,
+                    K=instr.strike,
+                    T=T,
+                    sigma=sigma,
+                    r=rate,
+                    option_type=instr.option_type,
+                )
+
+        holding_period_matrices[scenario["name"]] = P_hold
+
+    return holding_period_matrices
 
 
 # ─────────────────────────────────────────────────────────────────────────────

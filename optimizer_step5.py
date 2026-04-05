@@ -96,6 +96,7 @@ async def _fetch_single_margin(
     instrument_name: str,
     amount: int,
     spot_price: float,
+    mark_price: float,
 ) -> Optional[float]:
     """
     Query Deribit /public/get_margins for one instrument.
@@ -105,12 +106,17 @@ async def _fetch_single_margin(
         instrument_name: Deribit instrument name (e.g. "ETH-16JAN25-2000-P").
         amount:          Contract count (positive=buy, negative=sell).
         spot_price:      Current ETH/USD spot for ETH→USD conversion.
+        mark_price:      Mark price in ETH (used in API call).
 
     Returns:
         Initial margin in USD for this leg, or None on failure.
     """
     url = f"{DERIBIT_BASE_URL}/public/get_margins"
-    params = {"instrument_name": instrument_name, "amount": amount}
+    params = {
+        "instrument_name": instrument_name,
+        "amount": abs(amount),
+        "price": mark_price,
+    }
 
     result = await _get_with_retry(session, url, params)
     if result is None:
@@ -175,6 +181,7 @@ async def fetch_real_margins(
                     instruments[idx].name,
                     int(x[idx]),
                     spot_price,
+                    instruments[idx].mark_price,
                 )
                 return idx, margin
 
@@ -229,6 +236,7 @@ def _build_updated_package(
         gamma_vec   = pkg.greeks.gamma_vec,
         theta_usd   = pkg.greeks.theta_usd,
         vega_usd    = pkg.greeks.vega_usd,
+        fee_vec     = pkg.greeks.fee_vec,
         margin_vec  = new_margin_vec,
     )
     return replace(pkg, greeks=new_greeks)

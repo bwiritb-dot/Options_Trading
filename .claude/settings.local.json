@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__lightrag__get_documents",
+      "mcp__lightrag__query_document",
+      "WebSearch",
+      "mcp__lightrag__delete_by_doc_ids",
+      "mcp__lightrag__insert_document",
+      "Bash(ls -la /d/Options_Trading/*.py /d/Options_Trading/*.md)"
+    ]
+  }
+}

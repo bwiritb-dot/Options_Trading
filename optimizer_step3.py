@@ -45,10 +45,10 @@ from optimizer_step2 import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Каскад солверов — пробуем в порядке приоритета
-PREFERRED_MIP_SOLVERS: list[str] = ["GLPK_MI", "HIGHS", "CBC", "SCIP"]
+PREFERRED_MIP_SOLVERS: list[str] = ["HIGHS", "GLPK_MI", "CBC", "SCIP"]
 
 # Настройки солвера
-SOLVER_TIME_LIMIT_SECONDS: int  = 120
+SOLVER_TIME_LIMIT_SECONDS: int  = 300  # 5 min — needed for max_qty=100 with HiGHS
 SOLVER_MAX_ITERS: int           = 10_000
 SOLVER_EPS_ABS: float           = 1e-6
 
@@ -353,6 +353,7 @@ def _solve_with_solver(
         solver_opts["msg_lev"]  = 0  # GLPK_MSG_OFF
     elif solver_name == "HIGHS":
         solver_opts["time_limit"] = SOLVER_TIME_LIMIT_SECONDS
+        solver_opts["mip_rel_gap"] = 0.02  # Accept 2% suboptimality for faster convergence
     elif solver_name == "CBC":
         solver_opts["maximumSeconds"] = SOLVER_TIME_LIMIT_SECONDS
     elif solver_name == "SCIP":

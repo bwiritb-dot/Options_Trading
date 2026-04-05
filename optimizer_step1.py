@@ -49,7 +49,7 @@ SCORE_OI_NORMALIZER: float = 1_000.0        # contracts
 
 # HTTP client settings
 HTTP_TIMEOUT_SECONDS: int = 10
-HTTP_CONCURRENCY_LIMIT: int = 40    # max parallel order-book requests
+HTTP_CONCURRENCY_LIMIT: int = 10    # max parallel order-book requests
 HTTP_RETRY_ATTEMPTS: int = 3
 HTTP_RETRY_BASE_DELAY: float = 0.5  # seconds, doubles each retry
 
@@ -144,9 +144,11 @@ async def _get_with_retry(
                     log.warning("Rate limited on %s, backing off %.1fs", url, delay * 2)
                     await asyncio.sleep(delay * 2)
                 else:
+                    body = await resp.text()
                     log.warning(
-                        "HTTP %s on %s (attempt %d/%d)",
+                        "HTTP %s on %s (attempt %d/%d): %s",
                         resp.status, url, attempt, HTTP_RETRY_ATTEMPTS,
+                        body[:200],
                     )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.warning(
