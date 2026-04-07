@@ -1,11 +1,6 @@
 CLAUDE.md
-IMPLEMENTATION_GUIDE.md
-optimizer.py
-optimizer_chart.py
-optimizer_step1.py
-optimizer_step2.py
-optimizer_step3.py
-optimizer_step4.py
-optimizer_step5.py
-rag_auto_sync.py
-resync_rag.py
+WEEKLY_TOOL_SPEC.md
+position_builder/README.md
+position_builder/TROUBLESHOOTING.md
+position_builder/app.py
+position_builder/requirements.txt
