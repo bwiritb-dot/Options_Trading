@@ -6,7 +6,16 @@
       "WebSearch",
       "mcp__lightrag__delete_by_doc_ids",
       "mcp__lightrag__insert_document",
-      "Bash(ls -la /d/Options_Trading/*.py /d/Options_Trading/*.md)"
+      "Bash(ls -la /d/Options_Trading/*.py /d/Options_Trading/*.md)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh api:*)",
+      "mcp__lightrag__check_lightrag_health",
+      "mcp__lightrag__get_graph_labels",
+      "mcp__lightrag__get_pipeline_status",
+      "Bash(where rtk:*)",
+      "Bash(rm ~/.claude/commands/rtk.md)",
+      "Bash(rmdir ~/.claude/commands)"
     ]
   }
 }
