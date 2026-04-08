@@ -3,7 +3,7 @@ from flask_cors import CORS
 import requests
 import numpy as np
 from scipy.stats import norm
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
 app = Flask(__name__)
@@ -210,8 +210,8 @@ def calculate_pnl_curve():
     current_price = data.get("current_price", None) or fetch_current_price()
     in_eth        = data.get("currency", "USD") == "ETH"
 
-    time_now      = datetime.now()
-    selected_time = datetime.fromisoformat(time_date.replace("Z", "+00:00")).replace(tzinfo=None)
+    time_now      = datetime.now(timezone.utc).replace(tzinfo=None)   # Bug #3 fix: use UTC consistently
+    selected_time = datetime.fromisoformat(time_date.replace("Z", "")).replace(tzinfo=None)
     risk_free     = 0.05 + rate_shift
 
     spot_min = current_price * 0.60
@@ -224,7 +224,7 @@ def calculate_pnl_curve():
         spot_min = min(spot_min, strike * 0.88)
         spot_max = max(spot_max, strike * 1.12)
 
-    spots = np.linspace(spot_min, spot_max, 200)
+    spots = np.linspace(spot_min, spot_max, 150)
 
     pnl_expiry = np.zeros(len(spots))
     pnl_theo   = np.zeros(len(spots))
@@ -233,18 +233,25 @@ def calculate_pnl_curve():
         name      = pos["instrument_name"]
         amount    = pos["amount"]
         avg_price = pos.get("avg_price", pos.get("mark_price", 0))
-        iv        = max(pos.get("iv", 60), 1) / 100      # from pct → decimal
+        iv_raw    = pos.get("iv") or 60        # 0 or None → 60% default (never 1%)
+        iv        = max(iv_raw, 5) / 100       # floor at 5%, convert pct → decimal
         adj_iv    = max(iv * (1 + vol_shift), 0.001)
+
+        # amount is signed: positive = long, negative = short (set by frontend: amount * side)
+        amount_signed = amount
 
         parts       = name.split("-")
         strike      = float(parts[2])
         option_type = "CALL" if parts[3] == "C" else "PUT"
         expiry_str  = parts[1]   # e.g. "10APR26"
-        expiry_dt   = datetime.strptime(expiry_str, "%d%b%y")
+        expiry_dt   = datetime.strptime(expiry_str, "%d%b%y") + timedelta(hours=8)  # Deribit expires 08:00 UTC
 
         T_expiry  = max((expiry_dt - time_now).total_seconds() / (365.25*24*3600), 0.0)
         T_slider  = max((selected_time - time_now).total_seconds() / (365.25*24*3600), 0.0)
         T_remain  = max(T_expiry - T_slider, 0.0)   # time-to-expiry at the slider date
+
+        # Bug #1 fix: lock entry cost to current_price, not the iterated spot S
+        entry_usd = avg_price * current_price   # Deribit marks in ETH of index
 
         for i, S in enumerate(spots):
             # ---- expiry payoff (intrinsic) ----
@@ -253,9 +260,7 @@ def calculate_pnl_curve():
             else:
                 intrinsic = max(strike - S, 0.0)
 
-            # Convert entry price to USD
-            entry_usd = avg_price * S  # Deribit quotes in ETH of index
-            pnl_e     = (intrinsic - entry_usd) * amount
+            pnl_e = (intrinsic - entry_usd) * amount_signed
             if in_eth and current_price:
                 pnl_e /= current_price
             pnl_expiry[i] += pnl_e
@@ -267,7 +272,7 @@ def calculate_pnl_curve():
                 theo_usd = BlackScholesCalculator.option_price(
                     S, strike, T_remain, risk_free, adj_iv, option_type
                 )
-            pnl_t = (theo_usd - entry_usd) * amount
+            pnl_t = (theo_usd - entry_usd) * amount_signed
             if in_eth and current_price:
                 pnl_t /= current_price
             pnl_theo[i] += pnl_t
@@ -296,9 +301,9 @@ def calculate_greeks():
     option_type = "CALL" if parts[3] == "C" else "PUT"
     expiry_str = parts[1]  # e.g., "10APR26"
 
-    # Parse expiry date
-    expiry = datetime.strptime(expiry_str, "%d%b%y")
-    time_to_expiry = (expiry - datetime.now()).total_seconds() / (365.25 * 24 * 3600)
+    # Parse expiry date — Deribit expires at 08:00 UTC
+    expiry = datetime.strptime(expiry_str, "%d%b%y") + timedelta(hours=8)
+    time_to_expiry = (expiry - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds() / (365.25 * 24 * 3600)
     time_to_expiry = max(time_to_expiry, 0.001)  # Minimum 1 day
 
     # IV is provided in percent (e.g. 63.0 = 63%), convert to decimal
@@ -318,6 +323,39 @@ def calculate_greeks():
         "vega": vega,
         "theta": theta
     })
+
+
+@app.route("/api/market-data", methods=["GET"])
+def get_market_data():
+    """
+    Full market snapshot for all active ETH options (used by MILP optimizer).
+    Returns bid_price, ask_price, mark_price, mark_iv for every instrument.
+    """
+    try:
+        r = requests.get(
+            f"{DERIBIT_API}/public/get_book_summary_by_currency",
+            params={"currency": "ETH", "kind": "option"},
+            timeout=20
+        )
+        if r.status_code == 200:
+            raw = r.json().get("result", [])
+            # Normalise field names so frontend can use bid_price / ask_price
+            data = []
+            for item in raw:
+                data.append({
+                    "instrument_name": item.get("instrument_name"),
+                    "mark_price":      item.get("mark_price", 0),
+                    "mark_iv":         item.get("mark_iv", 0),
+                    "bid_price":       item.get("bid_price", 0),
+                    "ask_price":       item.get("ask_price", 0),
+                    "underlying_price": item.get("underlying_price", 0),
+                })
+            return jsonify({"data": data})
+    except requests.exceptions.Timeout:
+        print("❌ market-data timeout")
+    except Exception as e:
+        print(f"❌ market-data error: {e}")
+    return jsonify({"data": []})
 
 
 if __name__ == "__main__":
